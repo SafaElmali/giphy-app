@@ -4,148 +4,101 @@ on:
   repository_dispatch:
     types: [linear_issue_created]
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   handle-linear-issue:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (full history)
         uses: actions/checkout@v4
-        
+        with:
+          fetch-depth: 0
+
       - name: Extract Linear Issue Data
-        id: linear-data
+        id: linear
         run: |
-          echo "Issue ID: ${{ github.event.client_payload.issueId }}"
-          echo "Issue Title: ${{ github.event.client_payload.issueTitle }}"
-          echo "Issue URL: ${{ github.event.client_payload.issueUrl }}"
-          
-          # Set outputs for use in other steps
           echo "issue_id=${{ github.event.client_payload.issueId }}" >> $GITHUB_OUTPUT
           echo "issue_title=${{ github.event.client_payload.issueTitle }}" >> $GITHUB_OUTPUT
           echo "issue_url=${{ github.event.client_payload.issueUrl }}" >> $GITHUB_OUTPUT
-          
-      - name: Create Issue Branch
+
+      - name: Compute branch name
+        id: names
         run: |
-          # Create a branch name based on the Linear issue
-          BRANCH_NAME="linear-${{ steps.linear-data.outputs.issue_id }}"
-          echo "Creating branch: $BRANCH_NAME"
-          
-          # Configure git
-          git config --global user.name 'Linear Webhook Bot'
-          git config --global user.email 'noreply@github.com'
-          
-          # Create and switch to new branch
-          git checkout -b "$BRANCH_NAME"
-          
-          # Create a placeholder file for the issue
+          # branch: linear-<ISSUE_ID>-<slug-of-title>
+          TITLE_SLUG="$(echo "${{ steps.linear.outputs.issue_title }}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9- ' | tr ' ' '-' | sed 's/--*/-/g' | cut -c1-40)"
+          BRANCH="linear-${{ steps.linear.outputs.issue_id }}${TITLE_SLUG:+-$TITLE_SLUG}"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Create branch from latest main
+        run: |
+          git config user.name 'Linear Webhook Bot'
+          git config user.email 'noreply@github.com'
+          git fetch origin main
+          git checkout -B "${{ steps.names.outputs.branch }}" origin/main
+
+      - name: Add tracking file and commit
+        run: |
           mkdir -p issues
-          cat > "issues/${{ steps.linear-data.outputs.issue_id }}.md" << EOF
-          # Linear Issue: ${{ steps.linear-data.outputs.issue_title }}
-          
-          **Issue ID:** ${{ steps.linear-data.outputs.issue_id }}
-          **Created:** $(date)
-          **Linear URL:** ${{ steps.linear-data.outputs.issue_url }}
-          
+          cat > "issues/${{ steps.linear.outputs.issue_id }}.md" << 'EOF'
+          # Linear Issue: ${{ steps.linear.outputs.issue_title }}
+
+          **Issue ID:** ${{ steps.linear.outputs.issue_id }}
+          **Created:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          **Linear URL:** ${{ steps.linear.outputs.issue_url }}
+
           ## Description
           This file was automatically created from a Linear issue.
-          
+
           ## Tasks
           - [ ] Review issue requirements
           - [ ] Implement solution
           - [ ] Test changes
-          - [ ] Create pull request
+          - [ ] Update this PR
           EOF
-          
-          # Add and commit the file
           git add .
-          git commit -m "Add tracking file for Linear issue ${{ steps.linear-data.outputs.issue_id }}"
-          
-      - name: Push Branch
-        run: |
-          BRANCH_NAME="linear-${{ steps.linear-data.outputs.issue_id }}"
-          git push origin "$BRANCH_NAME"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
+          git commit -m "chore: bootstrap for ${{ steps.linear.outputs.issue_id }}"
+
+      - name: Push branch
+        run: git push -u origin "${{ steps.names.outputs.branch }}"
+
       - name: Create Pull Request
+        id: create_pull_request
         uses: actions/github-script@v7
         with:
           script: |
-            const { data: pullRequest } = await github.rest.pulls.create({
+            const title = `Linear: ${{ steps.linear.outputs.issue_id }} — ${{ steps.linear.outputs.issue_title }}`;
+            const body = `
+            ## Linear Issue Integration
+
+            **Issue ID:** ${{ steps.linear.outputs.issue_id }}
+            **Title:** ${{ steps.linear.outputs.issue_title }}
+            **Linear URL:** ${{ steps.linear.outputs.issue_url }}
+
+            This PR was created automatically from a Linear webhook.
+            `;
+            const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Linear Issue: ${{ steps.linear-data.outputs.issue_title }}`,
-              head: `linear-${{ steps.linear-data.outputs.issue_id }}`,
-              base: 'main',
-              body: `
-              ## Linear Issue Integration
-              
-              **Issue ID:** ${{ steps.linear-data.outputs.issue_id }}
-              **Issue Title:** ${{ steps.linear-data.outputs.issue_title }}
-              **Linear URL:** ${{ steps.linear-data.outputs.issue_url }}
-              
-              This pull request was automatically created from a Linear issue webhook.
-              
-              ### What this PR does:
-              - Creates a tracking file for the Linear issue
-              - Sets up a development branch for this issue
-              - Links the GitHub PR to the Linear issue
-              
-              ### Next Steps:
-              1. Review the Linear issue requirements
-              2. Implement the necessary changes
-              3. Update this PR with your implementation
-              4. Request review when ready
-              
-              ---
-              *This PR was created automatically by the Linear webhook integration.*
-              `
+              title,
+              head: "${{ steps.names.outputs.branch }}",
+              base: "main",
+              body,
+              draft: true
             });
-            
-            console.log(`Created pull request #${pullRequest.number}`);
-            
-      - name: Add Comment to PR
+            core.setOutput("pr_number", pr.number);
+
+      - name: Comment on PR
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            // Find the PR we just created
-            const { data: prs } = await github.rest.pulls.list({
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              head: `${context.repo.owner}:linear-${{ steps.linear-data.outputs.issue_id }}`,
-              state: 'open'
-            });
-            
-            if (prs.length > 0) {
-              const pr = prs[0];
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr.number,
-                body: `🎯 **Linear Integration Active**
-                
-                This PR is linked to Linear issue: [${{ steps.linear-data.outputs.issue_id }}](${{ steps.linear-data.outputs.issue_url }})
-                
-                **Workflow completed:**
-                ✅ Branch created: \`linear-${{ steps.linear-data.outputs.issue_id }}\`
-                ✅ Issue tracking file created
-                ✅ Pull request opened
-                
-                Ready for development! 🚀`
-              });
-            }
-            
-      - name: Workflow Summary
-        run: |
-          echo "## 🎉 Linear Webhook Integration Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Issue Details:**" >> $GITHUB_STEP_SUMMARY
-          echo "- **ID:** ${{ steps.linear-data.outputs.issue_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Title:** ${{ steps.linear-data.outputs.issue_title }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **URL:** ${{ steps.linear-data.outputs.issue_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Actions Taken:**" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Created branch: \`linear-${{ steps.linear-data.outputs.issue_id }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Added issue tracking file" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Created pull request" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Ready for development" >> $GITHUB_STEP_SUMMARY
+              issue_number: Number("${{ steps.create_pull_request.outputs.pr_number || 0 }}") || undefined,
+              body: `🎯 Linked to Linear: [${{ steps.linear.outputs.issue_id }}](${{ steps.linear.outputs.issue_url }})`
+            }).catch(() => {});
