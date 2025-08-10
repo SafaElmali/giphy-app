@@ -1,0 +1,8 @@
+{
+  "analysis": "Basic component generated for: create a user dashboard with charts and analytics",
+  "files_created": [
+    "src/components/CreateAUserDashboardWithChartsAndAnalytics.tsx"
+  ],
+  "dependencies": [],
+  "instructions": "Complete the implementation based on the Linear issue requirements"
+}
